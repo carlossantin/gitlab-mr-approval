@@ -1,0 +1,302 @@
+diff --git a/app/assets/javascripts/vue_merge_request_widget/components/states/ready_to_merge.vue b/app/assets/javascripts/vue_merge_request_widget/components/states/ready_to_merge.vue
+index 851939d5d4e..a7b70d41df3 100644
+--- a/app/assets/javascripts/vue_merge_request_widget/components/states/ready_to_merge.vue
++++ b/app/assets/javascripts/vue_merge_request_widget/components/states/ready_to_merge.vue
+@@ -4,6 +4,7 @@ import warningSvg from 'icons/_icon_status_warning.svg';
+ import simplePoll from '~/lib/utils/simple_poll';
+ import { __ } from '~/locale';
+ import readyToMergeMixin from 'ee_else_ce/vue_merge_request_widget/mixins/ready_to_merge';
++import approveMergeRequestMixin from '../../mixins/approve_merge_request';
+ import MergeRequest from '../../../merge_request';
+ import Flash from '../../../flash';
+ import statusIcon from '../mr_widget_status_icon.vue';
+@@ -22,7 +23,7 @@ export default {
+     CommitEdit,
+     CommitMessageDropdown,
+   },
+-  mixins: [readyToMergeMixin],
++  mixins: [readyToMergeMixin, approveMergeRequestMixin],
+   props: {
+     mr: { type: Object, required: true },
+     service: { type: Object, required: true },
+@@ -232,6 +233,24 @@ export default {
+ 
+ <template>
+   <div>
++    <div class="mr-widget-body media">
++      <status-icon :status="iconClass" />
++      <div class="media-body">
++        <div class="mr-widget-body-controls media space-children">
++          <span class="btn-group">
++            <button
++              :disabled="isApprovedButtonDisabled"
++              type="button"
++              class="btn mr-3 btn-primary btn-sm"
++              @click="handleApproveButtonClick()"
++            >
++              <i v-if="isMakingRequest" class="fa fa-spinner fa-spin" aria-hidden="true"></i>
++              {{ approveButtonText }}
++            </button>
++          </span>
++        </div>
++      </div>
++    </div>
+     <div class="mr-widget-body media">
+       <status-icon :status="iconClass" />
+       <div class="media-body">
+diff --git a/app/assets/javascripts/vue_merge_request_widget/mr_widget_options.vue b/app/assets/javascripts/vue_merge_request_widget/mr_widget_options.vue
+index bf175eb5f69..693aaf29844 100644
+--- a/app/assets/javascripts/vue_merge_request_widget/mr_widget_options.vue
++++ b/app/assets/javascripts/vue_merge_request_widget/mr_widget_options.vue
+@@ -160,6 +160,7 @@ export default {
+     getServiceEndpoints(store) {
+       return {
+         mergePath: store.mergePath,
++        approvePath: store.approvePath,
+         mergeCheckPath: store.mergeCheckPath,
+         cancelAutoMergePath: store.cancelAutoMergePath,
+         removeWIPPath: store.removeWIPPath,
+diff --git a/app/assets/javascripts/vue_merge_request_widget/services/mr_widget_service.js b/app/assets/javascripts/vue_merge_request_widget/services/mr_widget_service.js
+index 0bb70bfd658..faa078a40ac 100644
+--- a/app/assets/javascripts/vue_merge_request_widget/services/mr_widget_service.js
++++ b/app/assets/javascripts/vue_merge_request_widget/services/mr_widget_service.js
+@@ -9,6 +9,10 @@ export default class MRWidgetService {
+     return axios.post(this.endpoints.mergePath, data);
+   }
+ 
++  approve() {
++    return axios.post(this.endpoints.approvePath);
++  }
++
+   cancelAutomaticMerge() {
+     return axios.post(this.endpoints.cancelAutoMergePath);
+   }
+diff --git a/app/assets/javascripts/vue_merge_request_widget/stores/mr_widget_store.js b/app/assets/javascripts/vue_merge_request_widget/stores/mr_widget_store.js
+index 45708d78886..d0d17c6e470 100644
+--- a/app/assets/javascripts/vue_merge_request_widget/stores/mr_widget_store.js
++++ b/app/assets/javascripts/vue_merge_request_widget/stores/mr_widget_store.js
+@@ -77,6 +77,8 @@ export default class MergeRequestStore {
+     this.onlyAllowMergeIfPipelineSucceeds = data.only_allow_merge_if_pipeline_succeeds || false;
+     this.mergeWhenPipelineSucceeds = data.merge_when_pipeline_succeeds || false;
+     this.mergePath = data.merge_path;
++    this.approvePath = data.approve_path;
++    this.currentUserHasApproved = data.current_user_has_approved;
+     this.ffOnlyEnabled = data.ff_only_enabled;
+     this.shouldBeRebased = !!data.should_be_rebased;
+     this.statusPath = data.status_path;
+diff --git a/app/controllers/projects/merge_requests_controller.rb b/app/controllers/projects/merge_requests_controller.rb
+index 8f177895b08..6aa76456144 100644
+--- a/app/controllers/projects/merge_requests_controller.rb
++++ b/app/controllers/projects/merge_requests_controller.rb
+@@ -101,6 +101,11 @@ class Projects::MergeRequestsController < Projects::MergeRequests::ApplicationCo
+     reports_response(@merge_request.compare_test_reports)
+   end
+ 
++  def approve
++    merge_service = ::MergeRequests::MergeService.new(@project, current_user, merge_params)
++    merge_service.approve(@merge_request)
++  end
++
+   def edit
+     define_edit_vars
+   end
+diff --git a/app/models/merge_request.rb b/app/models/merge_request.rb
+index 311ba1ce6bd..caeaca38d98 100644
+--- a/app/models/merge_request.rb
++++ b/app/models/merge_request.rb
+@@ -34,6 +34,8 @@ class MergeRequest < ApplicationRecord
+ 
+   has_internal_id :iid, scope: :target_project, init: ->(s) { s&.target_project&.merge_requests&.maximum(:iid) }
+ 
++  has_many :approvals, dependent: :destroy
++
+   has_many :merge_request_diffs
+ 
+   has_one :merge_request_diff,
+@@ -221,6 +223,10 @@ class MergeRequest < ApplicationRecord
+       .pluck(:target_branch)
+   end
+ 
++  def hasApprovals?
++    approvals.size > 0
++  end
++
+   def rebase_in_progress?
+     strong_memoize(:rebase_in_progress) do
+       # The source project can be deleted
+@@ -752,7 +758,7 @@ class MergeRequest < ApplicationRecord
+ 
+     check_if_can_be_merged
+ 
+-    can_be_merged? && !should_be_rebased?
++    can_be_merged? && !should_be_rebased? && approvals.size > 0
+   end
+ 
+   def mergeable_state?(skip_ci_check: false, skip_discussions_check: false)
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 2eb5c63a4cc..042c076de46 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -143,6 +143,7 @@ class User < ApplicationRecord
+   has_many :notification_settings
+   has_many :award_emoji,              dependent: :destroy # rubocop:disable Cop/ActiveRecordDependent
+   has_many :triggers,                 dependent: :destroy, class_name: 'Ci::Trigger', foreign_key: :owner_id # rubocop:disable Cop/ActiveRecordDependent
++  has_many :approvals,                dependent: :destroy
+ 
+   has_many :issue_assignees
+   has_many :assigned_issues, class_name: "Issue", through: :issue_assignees, source: :issue
+diff --git a/app/presenters/merge_request_presenter.rb b/app/presenters/merge_request_presenter.rb
+index ba0711ca867..70a30836186 100644
+--- a/app/presenters/merge_request_presenter.rb
++++ b/app/presenters/merge_request_presenter.rb
+@@ -98,6 +98,21 @@ class MergeRequestPresenter < Gitlab::View::Presenter::Delegated
+     end
+   end
+ 
++  def approve_path
++    if target_branch_exists?
++      project_merge_request_path(project, merge_request) + '/approve'
++    end
++  end
++
++  def approves_count
++    merge_request.approvals.size
++  end
++
++  def currentUserHasApproved
++    userApproval = merge_request.approvals.select { |approval| approval.user.id == current_user.id }
++    return !userApproval.nil? && !userApproval.empty?
++  end
++
+   def target_branch_path
+     if target_branch_exists?
+       project_branch_path(project, target_branch)
+diff --git a/app/serializers/merge_request_widget_entity.rb b/app/serializers/merge_request_widget_entity.rb
+index b130f447cce..d7a631c05ca 100644
+--- a/app/serializers/merge_request_widget_entity.rb
++++ b/app/serializers/merge_request_widget_entity.rb
+@@ -164,6 +164,18 @@ class MergeRequestWidgetEntity < IssuableEntity
+     presenter(merge_request).target_branch_commits_path
+   end
+ 
++  expose :approve_path do |merge_request|
++    presenter(merge_request).approve_path
++  end
++
++  expose :approves_count do |merge_request|
++    presenter(merge_request).approves_count
++  end
++
++  expose :current_user_has_approved do |merge_request|
++    presenter(merge_request).currentUserHasApproved
++  end
++
+   expose :target_branch_tree_path do |merge_request|
+     presenter(merge_request).target_branch_tree_path
+   end
+diff --git a/app/services/merge_requests/merge_service.rb b/app/services/merge_requests/merge_service.rb
+index d8a78001b79..8ebecb0b093 100644
+--- a/app/services/merge_requests/merge_service.rb
++++ b/app/services/merge_requests/merge_service.rb
+@@ -32,9 +32,43 @@ module MergeRequests
+       handle_merge_error(log_message: e.message, save_message_on_model: true)
+     end
+ 
++    def approve(merge_request)
++      @merge_request = merge_request
++      approval = Approval.new(user: current_user)
++      @merge_request.approvals.push(approval)
++    end
++
++    def removeApproval(merge_request)
++      @merge_request = merge_request
++      @merge_request.approvals.each do |approval|
++        if (approval.user.id == current_user.id)
++          @merge_request.approvals.delete(approval)
++        end
++      end
++    end
++
++    def currentUserHasApproved(merge_request)
++      @merge_request = merge_request
++      userApproval = @merge_request.approvals.select { |approval| approval.user.id == current_user.id }
++      return !userApproval.nil? && !userApproval.empty?
++    end
++
+     private
+ 
++    def findUsersFromApprovalGroup
++      approvalGroup = Group.find_by(name: 'approval_users')
++      members = Member.where(source_id: approvalGroup.id)
++      users = []
++      members.each do |member|
++        users.push(member.user)
++      end
++      return users
++    end
++
+     def validate!
++      unless @merge_request.hasApprovals?
++        raise_error('This merge request does not have approvals')
++      end
+       authorization_check!
+       error_check!
+     end
+diff --git a/config/routes/project.rb b/config/routes/project.rb
+index 1e94bdc245f..6d131c74b22 100644
+--- a/config/routes/project.rb
++++ b/config/routes/project.rb
+@@ -181,6 +181,7 @@ constraints(::Constraints::ProjectUrlConstrainer.new) do
+         member do
+           get :commit_change_content
+           post :merge
++          post :approve
+           post :cancel_merge_when_pipeline_succeeds
+           get :pipeline_status
+           get :ci_environments_status
+diff --git a/db/schema.rb b/db/schema.rb
+index bb59af540fe..d0de23d2485 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema.define(version: 20190524062810) do
++ActiveRecord::Schema.define(version: 20190529132133) do
+ 
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "plpgsql"
+@@ -196,6 +196,15 @@ ActiveRecord::Schema.define(version: 20190524062810) do
+     t.index ["usage_stats_set_by_user_id"], name: "index_application_settings_on_usage_stats_set_by_user_id", using: :btree
+   end
+ 
++  create_table "approvals", force: :cascade do |t|
++    t.bigint "user_id"
++    t.bigint "merge_request_id"
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["merge_request_id"], name: "index_approvals_on_merge_request_id", using: :btree
++    t.index ["user_id"], name: "index_approvals_on_user_id", using: :btree
++  end
++
+   create_table "audit_events", id: :serial, force: :cascade do |t|
+     t.integer "author_id", null: false
+     t.string "type", null: false
+@@ -1909,6 +1918,7 @@ ActiveRecord::Schema.define(version: 20190524062810) do
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
+     t.index ["path"], name: "index_redirect_routes_on_path", unique: true, using: :btree
++    t.index ["path"], name: "index_redirect_routes_on_path_text_pattern_ops", using: :btree, opclasses: {"path"=>"varchar_pattern_ops"}
+     t.index ["source_type", "source_id"], name: "index_redirect_routes_on_source_type_and_source_id", using: :btree
+   end
+ 
+@@ -2423,6 +2433,8 @@ ActiveRecord::Schema.define(version: 20190524062810) do
+   end
+ 
+   add_foreign_key "application_settings", "users", column: "usage_stats_set_by_user_id", name: "fk_964370041d", on_delete: :nullify
++  add_foreign_key "approvals", "merge_requests"
++  add_foreign_key "approvals", "users"
+   add_foreign_key "badges", "namespaces", column: "group_id", on_delete: :cascade
+   add_foreign_key "badges", "projects", on_delete: :cascade
+   add_foreign_key "board_group_recent_visits", "boards", on_delete: :cascade
